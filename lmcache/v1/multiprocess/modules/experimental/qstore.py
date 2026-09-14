@@ -374,6 +374,7 @@ class QStoreModule(InstanceLivenessTarget):
                 "Q ring event backend is not initialized; register the Q cache "
                 "before submitting store requests"
             )
+        ipc_event_registry = self._ctx.ipc_event_registry(instance_id)
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
             key, list(range(num_object_groups))
@@ -418,16 +419,24 @@ class QStoreModule(InstanceLivenessTarget):
                     blocks_per_chunk,
                 )
                 event_backend.record_event(event, cache_context.stream)
-                return event_backend.export_event(event, cache_context.device), False
+                handle = event_backend.export_event(event, cache_context.device)
+                ipc_event_registry.hold_exported(handle, event)
+                return handle, False
 
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
                 cache_context, gpu_block_ids
             )
 
-            vllm_event = event_backend.import_event(
+            producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device
             )
-            event_backend.wait_event(vllm_event, cache_context.stream)
+            event_backend.wait_event(producer_event, cache_context.stream)
+            ipc_event_registry.hold_imported(event_ipc_handle, producer_event)
+            submit_callback_to_stream(
+                cache_context.cupy_stream,
+                "release_imported_event",
+                (instance_id, event_ipc_handle),
+            )
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -533,4 +542,6 @@ class QStoreModule(InstanceLivenessTarget):
                 num_chunks * self._ctx.chunk_size,
                 ed - st,
             )
-        return event_backend.export_event(event, cache_context.device), store_succeeded
+        handle = event_backend.export_event(event, cache_context.device)
+        ipc_event_registry.hold_exported(handle, event)
+        return handle, store_succeeded

@@ -26,6 +26,7 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
 )
+from lmcache.v1.multiprocess.futures import DeviceMessagingFuture
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
@@ -1848,6 +1849,22 @@ class LMCacheMPWorkerAdapter:
         return ret_stores
 
     @_lmcache_nvtx_annotate
+    def _release_completion_event(self, future: MessagingFuture[Any]) -> None:
+        """Tell the server this worker is done with ``future``'s completion event.
+
+        Called once the future reports done, so the server may drop the event
+        it exported for this transfer. Transfers that carried no device event
+        (engine-driven contexts, event-free failure replies) release nothing.
+
+        Args:
+            future: A finished store or retrieve future.
+        """
+        if not isinstance(future, DeviceMessagingFuture):
+            return
+        event_ipc_handle = future.raw_future_.result(timeout=0)[0]
+        if event_ipc_handle:
+            self.req_client.release_event(self.instance_id, event_ipc_handle)
+
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -1918,6 +1935,7 @@ class LMCacheMPWorkerAdapter:
                 continue
 
             s_result = s_future.result(timeout=60)
+            self._release_completion_event(s_future)
             finished_stores.add(request_id)
 
             if not s_result:
@@ -1932,6 +1950,7 @@ class LMCacheMPWorkerAdapter:
                 continue
 
             r_result = r_future.result(timeout=60)
+            self._release_completion_event(r_future)
             finished_retrieves.add(request_id)
 
             if not r_result:
@@ -2042,6 +2061,7 @@ class LMCacheMPWorkerAdapter:
                 continue
 
             s_result = s_future.result(timeout=60)
+            self._release_completion_event(s_future)
             finished_stores.add(request_id)
 
             if not s_result:
@@ -2057,6 +2077,7 @@ class LMCacheMPWorkerAdapter:
                 continue
 
             r_result = r_future.result(timeout=60)
+            self._release_completion_event(r_future)
             finished_retrieves.add(request_id)
 
             if not r_result:

@@ -187,7 +187,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
         )
+        self._device_host_func_dispatcher.register(
+            "release_imported_event",
+            self._release_imported_event,
+            payload_type=tuple[int, bytes],
+        )
         self._device_host_func_dispatcher.start()
+
+    def _release_imported_event(self, payload: tuple[int, bytes]) -> None:
+        """Drop an imported worker event; the stream wait queued on it has run.
+
+        Args:
+            payload: ``(instance_id, event_ipc_handle)`` of the imported event.
+        """
+        instance_id, event_ipc_handle = payload
+        self._ctx.ipc_event_registry(instance_id).release_imported(event_ipc_handle)
 
     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
         """Register *handler* for *kind* on the per-process device host-func
@@ -365,6 +379,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if ipc_collect is not None:
             # Backends without IPC collection omit this optional operation.
             ipc_collect()
+
+    @request_handler(
+        RequestType.RELEASE_EVENT,
+        HandlerType.BLOCKING,
+        requires_client_affinity=True,
+    )
+    def release_event(self, instance_id: int, event_ipc_handle: bytes) -> None:
+        """Drop an exported completion event; the worker is done with it.
+
+        Args:
+            instance_id: The worker instance that received the handle.
+            event_ipc_handle: Handle returned by STORE, RETRIEVE, or STORE_Q.
+        """
+        self._ctx.ipc_event_registry(instance_id).release_exported(event_ipc_handle)
 
     def report_status(self) -> dict:
         """Return GPU transfer module status information.
@@ -577,6 +605,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         event_backend = entry.event_backend
         if event_backend is None:
             raise RuntimeError("Registered cache context has no event backend")
+        ipc_event_registry = self._ctx.ipc_event_registry(instance_id)
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
@@ -622,7 +651,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     blocks_per_chunk,
                 )
                 event_backend.record_event(event, cache_context.stream)
-                return event_backend.export_event(event, cache_context.device), False
+                handle = event_backend.export_event(event, cache_context.device)
+                ipc_event_registry.hold_exported(handle, event)
+                return handle, False
 
             # Chunks whose block ids are all the null block (e.g. align-mode
             # Mamba chunks holding no real state) carry no valid KV and must not
@@ -643,6 +674,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 event_ipc_handle, cache_context.device
             )
             event_backend.wait_event(producer_event, cache_context.stream)
+            ipc_event_registry.hold_imported(event_ipc_handle, producer_event)
+            submit_callback_to_stream(
+                cache_context.cupy_stream,
+                "release_imported_event",
+                (instance_id, event_ipc_handle),
+            )
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -764,10 +801,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 num_chunks * self._ctx.chunk_size,
                 ed - st,
             )
-        return (
-            event_backend.export_event(event, cache_context.device),
-            store_succeeded,
-        )
+        handle = event_backend.export_event(event, cache_context.device)
+        ipc_event_registry.hold_exported(handle, event)
+        return handle, store_succeeded
 
     @request_handler(
         RequestType.RETRIEVE,
@@ -834,6 +870,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         event_backend = entry.event_backend
         if event_backend is None:
             raise RuntimeError("Registered cache context has no event backend")
+        ipc_event_registry = self._ctx.ipc_event_registry(instance_id)
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
@@ -900,7 +937,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     blocks_per_chunk,
                 )
                 event_backend.record_event(event, cache_context.stream)
-                return event_backend.export_event(event, cache_context.device), False
+                handle = event_backend.export_event(event, cache_context.device)
+                ipc_event_registry.hold_exported(handle, event)
+                return handle, False
 
             # Cut and stage all block_ids to GPU once before the transfer
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
@@ -910,6 +949,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 event_ipc_handle, cache_context.device
             )
             event_backend.wait_event(producer_event, cache_context.stream)
+            ipc_event_registry.hold_imported(event_ipc_handle, producer_event)
+            submit_callback_to_stream(
+                cache_context.cupy_stream,
+                "release_imported_event",
+                (instance_id, event_ipc_handle),
+            )
 
             # Per object group, the prefetch only locked the in-window suffix
             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full
@@ -1014,10 +1059,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 ed - st,
             )
 
-        return (
-            event_backend.export_event(event, cache_context.device),
-            retrieve_succeeded,
-        )
+        handle = event_backend.export_event(event, cache_context.device)
+        ipc_event_registry.hold_exported(handle, event)
+        return handle, retrieve_succeeded
 
     def _publish_token_bindings(
         self, key: IPCCacheServerKey, obj_keys: list[ObjectKey]
